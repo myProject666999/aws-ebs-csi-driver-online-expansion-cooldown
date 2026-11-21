@@ -1,0 +1,264 @@
+# Use of the EBS CSI Driver `Makefile`
+
+The EBS CSI Driver comes with a Makefile that can be used to develop, build, test, and release the driver. This file documents Makefile targets, the parameters they support, and common usage scenarios.
+
+## Prerequisites
+
+The `Makefile` has the following dependencies:
+- `go`: https://go.dev/doc/install
+- `python` (may be named `python3`) and `pip`: https://www.python.org/downloads/
+- `jq`: https://github.com/jqlang/jq/releases
+- `kubectl`: https://kubernetes.io/docs/tasks/tools/#kubectl
+- `git`: https://git-scm.com/downloads
+- `docker` and `docker buildx`: https://docs.docker.com/get-docker/ and https://github.com/docker/buildx#installing
+- `make`
+- Standard POSIX tools (`awk`, `grep`, `cat`, etc)
+
+All other tools are downloaded for you at runtime.
+
+## Building
+
+### `make cluster/image`
+
+Build and push an image of the driver for local development. Environment variables are accepted to override the `REGISTRY`, `IMAGE` name, and image `TAG`.
+
+### `make all-push`
+
+Build and push all image variants of the driver needed for an official release. This target is not intended or designed to be run outside of CI.
+
+## Local Development
+
+### `make` or `make bin/aws-ebs-csi-driver` or `make bin/aws-ebs-csi-driver.exe`
+
+Build a binary copy of the EBS CSI Driver for the local platform. This is the default behavior when calling `make` with no target.
+
+The target OS and/or architecture can be overridden via the `OS` and `ARCH` environment variables (for example, `OS=linux ARCH=arm64 make`)
+
+### `make test`
+
+Run all unit tests with race condition checking enabled.
+
+### `make verify`
+
+Performs local verification that other than unit tests (linters, manifest updates, etc)
+
+### `make update`
+
+Updates Kustomize manifests, formatting, and tidies `go.mod`. `make verify` will ensure that `make update` was run by checking if it creates a diff.
+
+## Cluster Management
+
+### `make cluster/create`
+
+Creates a cluster for running E2E tests against. There are many parameters that can be provided via environment variables, a full list is available in [`config.sh`](../hack/e2e/config.sh), but the primary parameters are:
+
+- `CLUSTER_TYPE`: The tool used to create the cluster, either `kops` or `eksctl` - defaults to `kops`
+- `CLUSTER_NAME`: The name of the cluster to create - defaults to `ebs-csi-e2e.k8s.local`
+- `INSTANCE_TYPE`: The instance type to use for cluster nodes - defaults to `c5.large`
+- `AMI_PARAMETER`: The SSM parameter of where to get the AMI for the cluster nodes (`kops` clusters only) - defaults to `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`
+- `AMI_FAMILY`: Which ami family to create a linux node group with for the cluster (`eksctl` clusters only) - defaults to `AmazonLinux2023`
+- `WINDOWS`: Whether or not to create a Windows node group for the cluster (`eksctl` clusters only) - defaults to `false`
+- `AWS_REGION`: Which region to create the cluster in - defaults to `us-west-2`
+- `AWS_AVAILABILITY_ZONES`: Which AZs to create nodes for the cluster in - defaults to the first `NUM_AZS` non-opt-in AZs in the region
+- `NUM_AZS`: How many AZs to auto-detect when `AWS_AVAILABILITY_ZONES` is unset - defaults to `2`
+- `OUTPOST_ARN`: If set, create an additional nodegroup on an [outpost](https://aws.amazon.com/outposts/) (`eksctl clusters only)
+- `OUTPOST_INSTANCE_TYPE`: The instance type to use for the outpost nodegroup (only used when `OUTPOST_ARN` is non-empty) - defaults to `INSTANCE_TYPE`
+
+#### Example: Create a default (`kops`) cluster
+
+```bash
+make cluster/create
+```
+
+#### Example: Create a cluster with only one Availability Zone
+```bash
+export AWS_AVAILABILITY_ZONES="us-west-2a"
+make cluster/create
+```
+
+#### Example: Create an `eksctl` cluster
+
+```bash
+export CLUSTER_TYPE="eksctl"
+make cluster/create
+```
+
+#### Example: Create a cluster with Graviton nodes for `arm64` testing
+
+```bash
+export INSTANCE_TYPE="m7g.medium"
+export AMI_PARAMETER="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
+make cluster/create
+```
+
+#### Example: Create a cluster with Windows nodes
+
+```bash
+export WINDOWS="true"
+export CLUSTER_TYPE="eksctl"
+make cluster/create
+```
+
+#### Example: Create a cluster with Bottlerocket nodes
+
+```bash
+export AMI_FAMILY="Bottlerocket"
+export CLUSTER_TYPE="eksctl"
+make cluster/create
+```
+
+#### Example: Create a cluster with an outpost nodegroup
+
+```bash
+export CLUSTER_TYPE="eksctl"
+export OUTPOST_ARN="arn:aws:outposts:us-east-1:123456789012:outpost/op-0f39f7c0af9b166a3"
+export OUTPOST_INSTANCE_TYPE=c5.xlarge
+make cluster/create
+```
+
+#### VPC Block Public Access
+
+Clusters work in accounts with [VPC Block Public Access](https://docs.aws.amazon.com/vpc/latest/userguide/security-vpc-bpa.html) (BPA) enabled:
+
+- `kops` clusters use private topology, so nodes and the control plane reach the internet through NAT. The utility subnets (API load balancer and NAT gateways) get a BPA exclusion, API access is left at the kops default.
+- `eksctl` nodegroups use private networking. Outpost nodegroups (`OUTPOST_ARN`) are not covered and have not been tested with BPA.
+
+### `make cluster/image`
+
+Builds an image for use in the E2E tests. This will automatically build the most appropriate image (for example, skipping Windows builds unless `WINDOWS` is set to `true`).
+
+#### Example: Build a standard image
+
+```bash
+make cluster/image
+```
+
+#### Example: Build an arm64 image
+
+```bash
+export IMAGE_ARCH="arm64"
+make cluster/image
+```
+
+#### Example: Build a Windows-compatible image
+
+```bash
+export WINDOWS="true"
+make cluster/image
+```
+
+### `make cluster/kubeconfig`
+
+Prints the `KUBECONFIG` environment variable for a cluster. You must pass the same `CLUSTER_TYPE` and `CLUSTER_NAME` as used when creating the cluster. This command must be `eval`ed to import the environment variables into your shell.
+
+#### Example: Export the `KUBECONFIG` for a default cluster
+
+```bash
+eval "$(make cluster/kubeconfig)"
+```
+
+#### Example: Export the `KUBECONFIG` for an `eksctl` cluster
+
+```bash
+export CLUSTER_TYPE="eksctl"
+eval "$(make cluster/kubeconfig)"
+```
+
+### `make cluster/delete`
+
+Deletes a cluster created by `make cluster/create`. You must pass the same `CLUSTER_TYPE` and `CLUSTER_NAME` as used when creating the cluster.
+
+### `make cluster/install`
+
+Install the EBS CSI Driver to the cluster via Helm. You must have already run `make cluster/image` to build the image for the cluster, or provide an image of your own.
+
+#### Example: Install the EBS CSI Driver to a cluster for testing
+
+```bash
+make cluster/image
+make cluster/install
+```
+
+### `make cluster/install`
+
+Install the EBS CSI Driver to the cluster via Helm using the default (release) image. This is useful for testing Helm-only changes.
+
+#### Example: Install the EBS CSI Driver to a cluster for testing a Helm-only change
+
+```bash
+make cluster/helm
+```
+
+### `make cluster/uninstall`
+
+Uninstall an installation of the EBS CSI Driver previously installed by `make cluster/install`.
+
+#### Example: Uninstall the EBS CSI Driver
+
+```bash
+make cluster/uninstall
+```
+
+## E2E Tests
+
+Run E2E tests against a cluster created by `make cluster/create`. You must pass the same `CLUSTER_TYPE` and `CLUSTER_NAME` as used when creating the cluster. You must have already run `make cluster/image` to build the image for the cluster, or provide an image of your own.
+
+Alternatively, you may run on an externally created cluster by passing `CLUSTER_TYPE` (required to determine which `values.yaml` to deploy) and `KUBECONFIG`. For `kops` clusters, the node IAM role should include the appropriate IAM policies to use the driver (see [the installation docs](./install.md#set-up-driver-permissions)). For `eksctl` clusters, the `ebs-csi-controller-sa` service account should be pre-created and setup to supply an IRSA role with the appropriate policies.
+
+### `make e2e/external`
+
+Run the Kubernetes upstream [external storage E2E tests](https://github.com/kubernetes/kubernetes/blob/master/test/e2e/README.md). This is the most comprehensive E2E test, recommended for local development.
+
+### `make e2e/functional`
+
+Run the EBS CSI functional E2E tests (the `[functional]` labeled specs) against a single multi-AZ cluster. `AWS_AVAILABILITY_ZONES` is derived automatically from the cluster's worker nodes. The multi-attach specs pin their volume to an AZ with at least two schedulable worker nodes and place two pods on different nodes sharing it, so the cluster must have at least two nodes in one AZ (the default `make cluster/create` satisfies this).
+
+### `make e2e/external-windows`
+
+Run the Kubernetes upstream [external storage E2E tests](https://github.com/kubernetes/kubernetes/blob/master/test/e2e/README.md) with Windows tests enabled. Requires a cluster with Windows nodes.
+
+### `make e2e/external-fips` and `make e2e/external-windows-fips`
+
+Enable FIPS mode in the standard driver image and run two upstream storage smoke tests: data persistence and offline volume expansion. Both tests provision and delete volumes. Both suites use the default filesystem test pattern. The Windows suite requires Windows nodes.
+
+### `make e2e/external-kustomize`
+
+Run the Kubernetes upstream [external storage E2E tests](https://github.com/kubernetes/kubernetes/blob/master/test/e2e/README.md), but using `kustomize` to deploy the driver instead of `helm`.
+
+### `make e2e/helm-ct`
+
+Test the EBS CSI Driver Helm chart via the [Helm `chart-testing` tool](https://github.com/helm/chart-testing).
+
+## Release Scripts
+
+### `make pre-release`
+
+Performs the in-repo preparation for a driver release: upgrades Go and Go dependencies (root and `tests/e2e` modules), refreshes the Dockerfile base image and sidecar digests and tags, regenerates all generated files (`make update`), and runs the unit tests and the vulnerability scan (`make security`). Leaves a diff ready to be committed as the pre-release PR.
+
+### `make post-release`
+
+Generates the post-release PR file changes after a release tag has been pushed: version references and draft changelog entries for both `CHANGELOG.md` (via the [Kubernetes `release-notes` tool](https://github.com/kubernetes/release/tree/master/cmd/release-notes)) and `charts/aws-ebs-csi-driver/CHANGELOG.md` (driver and sidecar versions). Requires `GITHUB_TOKEN` set to a GitHub token with repo read access.
+
+The changelog entries are drafts: review and edit them (release summary, urgent upgrade notes, chart features) before submitting the PR.
+
+#### Example: Generate the post-release PR changes for `v1.64.0`
+
+```bash
+GITHUB_TOKEN="ghp_..." make post-release NEW_VERSION=v1.64.0
+```
+
+### 'make update-image-dependencies'
+
+Convenience target to perform all image updates (including sidecars, kubekins-e2e-v2, and gcb-docker-gcloud). This is the primary target to use unless more granular control is needed.
+
+### `make update-sidecar-dependencies`
+
+Convenience target to perform all sidecar updates and regenerate the manifests. 
+
+### `make update-truth-sidecars`
+
+Retrieves the latest sidecar container images and creates or updates `hack/release-scripts/image-digests.yaml`.
+
+### `make generate-sidecar-tags`
+
+Updates the Kustomize and Helm sidecar tags with the values from `hack/release-scripts/image-digests.yaml`.

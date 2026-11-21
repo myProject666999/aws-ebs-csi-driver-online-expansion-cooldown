@@ -1,0 +1,286 @@
+#!/bin/bash
+
+# Copyright 2023 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This script deploys the EBS CSI Driver and runs e2e tests
+# CLUSTER_NAME and CLUSTER_TYPE are expected to be specified by the caller
+# All other environment variables have default values (see config.sh) but
+# many can be overridden on demand if needed
+
+set -euo pipefail
+
+BASE_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+BIN="${BASE_DIR}/../../bin"
+
+source "${BASE_DIR}/config.sh"
+source "${BASE_DIR}/util.sh"
+source "${BASE_DIR}/metrics/metrics.sh"
+
+## Setup
+
+if [[ "${CLUSTER_TYPE}" == "kops" ]]; then
+  HELM_VALUES_FILE="${BASE_DIR}/kops/values.yaml"
+  K8S_VERSION="${K8S_VERSION_KOPS}"
+elif [[ "${CLUSTER_TYPE}" == "eksctl" ]]; then
+  HELM_VALUES_FILE="${BASE_DIR}/eksctl/values.yaml"
+  K8S_VERSION="${K8S_VERSION_EKSCTL}"
+else
+  echo "Cluster type ${CLUSTER_TYPE} is invalid, must be kops or eksctl" >&2
+  exit 1
+fi
+
+# [env]-gated tests (pre-provisioned, topology-aware) read AWS_AVAILABILITY_ZONES
+# to target real AZs. When unset, derive it from the live worker nodes.
+if [[ -z "${AWS_AVAILABILITY_ZONES:-}" ]]; then
+  AWS_AVAILABILITY_ZONES=$(kubectl get nodes \
+    --kubeconfig "${KUBECONFIG}" \
+    --selector '!node-role.kubernetes.io/control-plane' \
+    --field-selector 'spec.unschedulable=false' \
+    -o jsonpath='{.items[*].metadata.labels.topology\.kubernetes\.io/zone}' | tr " " "\n" | sort -u | paste -sd, -)
+  if [[ -z "${AWS_AVAILABILITY_ZONES}" ]]; then
+    loudecho "ERROR. Could not derive AWS_AVAILABILITY_ZONES from cluster worker nodes. Set it explicitly or ensure worker nodes are labeled with topology.kubernetes.io/zone."
+    exit 1
+  fi
+  export AWS_AVAILABILITY_ZONES
+  loudecho "Derived AWS_AVAILABILITY_ZONES from cluster worker nodes: ${AWS_AVAILABILITY_ZONES}"
+fi
+
+if [[ "$WINDOWS" == true ]]; then
+  NODE_OS_DISTRO="windows"
+else
+  NODE_OS_DISTRO="linux"
+fi
+
+## Deploy
+
+if [[ "${CREATE_MISSING_FIS_ROLE}" == true ]]; then
+  if ! aws iam get-role --role-name "${FIS_ROLE_NAME}" >/dev/null 2>&1; then
+    loudecho "Creating IAM role ${FIS_ROLE_NAME} for AWS FIS"
+    aws iam create-role --role-name "${FIS_ROLE_NAME}" --tags Key=Shared,Value=Ignore \
+      --assume-role-policy-document "file://${BASE_DIR}/fis/trust-policy.json" >/dev/null
+  fi
+  aws iam put-role-policy --role-name "${FIS_ROLE_NAME}" --policy-name pause-volume-io \
+    --policy-document "file://${BASE_DIR}/fis/pause-volume-io-policy.json"
+fi
+
+if [[ "${EBS_INSTALL_SNAPSHOT}" == true ]]; then
+  loudecho "Applying snapshot controller and CRDs"
+  kubectl apply --kubeconfig "${KUBECONFIG}" -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/"${EBS_INSTALL_SNAPSHOT_VERSION}"/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml
+  kubectl apply --kubeconfig "${KUBECONFIG}" -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/"${EBS_INSTALL_SNAPSHOT_VERSION}"/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml
+  kubectl apply --kubeconfig "${KUBECONFIG}" -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/"${EBS_INSTALL_SNAPSHOT_VERSION}"/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml
+  kubectl apply --kubeconfig "${KUBECONFIG}" -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/"${EBS_INSTALL_SNAPSHOT_VERSION}"/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml
+  SNAPSHOT_CONTROLLER_MANIFEST="$(curl -L https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/"${EBS_INSTALL_SNAPSHOT_VERSION}"/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml)"
+  if [ -n "${EBS_INSTALL_SNAPSHOT_CUSTOM_IMAGE:-}" ]; then
+    SNAPSHOT_CONTROLLER_MANIFEST="$(yq ".spec.template.spec.containers[0].image=\"${EBS_INSTALL_SNAPSHOT_CUSTOM_IMAGE}\"" <<<${SNAPSHOT_CONTROLLER_MANIFEST})"
+  fi
+  kubectl apply --kubeconfig "${KUBECONFIG}" -f - <<<${SNAPSHOT_CONTROLLER_MANIFEST}
+fi
+
+if [[ "${HELM_CT_TEST}" != true ]] && [ -z "${SKIP_DRIVER_INSTALL+x}" ]; then
+  startSec=$(date +'%s')
+  install_driver
+  endSec=$(date +'%s')
+
+  deployTimeSeconds=$(((endSec - startSec) / 1))
+  loudecho "Driver deployment complete, time used: $deployTimeSeconds seconds"
+fi
+
+## Run tests
+
+if [[ "${HELM_CT_TEST}" == true ]]; then
+  loudecho "Test and lint Helm chart with chart-testing"
+  if [ -n "${PROW_JOB_ID:-}" ]; then
+    # Prow-specific setup
+    # Required becuase chart_testing ALWAYS needs a remote
+    git remote add ct https://github.com/kubernetes-sigs/aws-ebs-csi-driver.git
+    git fetch ct "${PULL_BASE_REF}"
+    export CT_REMOTE="ct"
+    export CT_TARGET_BRANCH="${PULL_BASE_REF}"
+  fi
+  set -x
+  set +e
+
+  (
+    while true; do
+      if kubectl get pod ebs-csi-driver-test -n kube-system --kubeconfig "${KUBECONFIG}" &>/dev/null; then
+        if kubectl wait --for=condition=ready pod ebs-csi-driver-test -n kube-system --timeout=300s --kubeconfig "${KUBECONFIG}"; then
+          kubectl logs -f ebs-csi-driver-test -n kube-system -c kubetest2 --kubeconfig "${KUBECONFIG}" >"${REPORT_DIR}/helm-test-pod.txt"
+        fi
+      fi
+      sleep 30
+    done
+  ) &
+  LOG_STREAM_PID=$!
+
+  KUBECONFIG="$KUBECONFIG" PATH="${BIN}:${PATH}" "${BIN}/ct" lint-and-install \
+    --config="${BASE_DIR}/../../tests/ct-config.yaml" \
+    --helm-extra-set-args="--set=image.repository=${IMAGE_NAME},image.tag=${IMAGE_TAG},node.tolerateAllTaints=false,controller.userAgentExtra=helm-test-dev"
+  TEST_PASSED=$?
+
+  if kill -0 $LOG_STREAM_PID 2>/dev/null; then
+    kill $LOG_STREAM_PID
+  fi
+
+  set -e
+  set +x
+else
+  loudecho "Testing focus ${GINKGO_FOCUS}"
+
+  if [[ $TEST_PATH == "./tests/e2e-kubernetes/..." ]]; then
+    pushd "${BASE_DIR}/../../tests/e2e-kubernetes"
+    packageVersion=$(echo $(cut -d '.' -f 1,2 <<<$K8S_VERSION))
+
+    # VolumeAttributesClass went GA in 1.34, older test packages can only decode v1beta1
+    if [[ $(cut -d '.' -f 2 <<<"${packageVersion}") -lt 34 ]]; then
+      sed -i 's|^apiVersion: storage.k8s.io/v1$|apiVersion: storage.k8s.io/v1beta1|' volumeattributesclass.yaml
+    fi
+
+    # TODO: Always skip broken upstream test - remove after fix released
+    GINKGO_SKIP="(should be protected by vac\\-protection finalizer)|should provision storage with pvc data source in parallel|${GINKGO_SKIP}"
+    GINKGO_SKIP="${GINKGO_SKIP%|}" # Strip trailing | if needed - remove with above TODO
+    set -x
+    set +e
+    # kubetest2 looks for deployers/testers in $PATH
+
+    # Regex matching volume expansion tests susceptible to transient failures on Windows due to defragsvc contention.
+    WINDOWS_VOLUME_EXPAND_REGEX="volume-expand|expansion of pvcs created for ephemeral"
+
+    TEST_PACKAGE_VERSION=${TEST_PACKAGE_VERSION:-$(curl -L https://dl.k8s.io/release/stable-${packageVersion}.txt)}
+
+    run_kubetest2() {
+      local run_id="$1"
+      local skip="$2"
+      local focus="$3"
+      local extra_ginkgo_args="${4:-}"
+
+      PATH="${BIN}:${PATH}" "${BIN}/kubetest2" noop \
+        --run-id="${run_id}" \
+        --test=ginkgo \
+        -- \
+        --skip-regex="${skip}" \
+        --focus-regex="${focus}" \
+        --test-package-version="${TEST_PACKAGE_VERSION}" \
+        ${KUBETEST2_USE_BUILT_BINARIES:+--use-built-binaries} \
+        --parallel=${GINKGO_PARALLEL} \
+        ${extra_ginkgo_args:+--ginkgo-args="${extra_ginkgo_args}"} \
+        --test-args="-storage.testdriver=${PWD}/manifests.yaml -kubeconfig=${KUBECONFIG} -node-os-distro=${NODE_OS_DISTRO}"
+    }
+
+    if [[ "${WINDOWS}" == true ]]; then
+      # Pass 1: Run all tests except volume-expand (no retries).
+      loudecho "Running non-volume-expand tests (no retries)"
+      run_kubetest2 "e2e-kubernetes" \
+        "${GINKGO_SKIP}|${WINDOWS_VOLUME_EXPAND_REGEX}" \
+        "${GINKGO_FOCUS}"
+      TEST_PASSED=$?
+
+      # Preserve Pass 1 JUnit results before Pass 2 overwrites them.
+      # kubetest2 writes JUnit XML to $ARTIFACTS (or ./_artifacts if unset).
+      _JUNIT_DIR="${ARTIFACTS:-_artifacts}"
+      for f in "${_JUNIT_DIR}"/junit*.xml; do
+        [ -f "$f" ] && mv "$f" "${f%.xml}_main.xml"
+      done
+
+      # Pass 2: Run only volume-expand tests with flake retries to tolerate
+      # transient defragsvc contention on Windows (StorageWMI error 4).
+      loudecho "Running volume-expand tests (with flake retries)"
+      run_kubetest2 "e2e-kubernetes-volume-expand" \
+        "${GINKGO_SKIP}" \
+        "${GINKGO_WINDOWS_VOLUME_EXPAND_FOCUS:-${GINKGO_FOCUS}.*(${WINDOWS_VOLUME_EXPAND_REGEX})}" \
+        "--flake-attempts=2"
+      VOLUME_EXPAND_PASSED=$?
+
+      if [[ ${VOLUME_EXPAND_PASSED} -ne 0 ]]; then
+        loudecho "WARNING: Volume expansion tests failed."
+        TEST_PASSED=1
+      fi
+    else
+      run_kubetest2 "e2e-kubernetes" "${GINKGO_SKIP}" "${GINKGO_FOCUS}"
+      TEST_PASSED=$?
+    fi
+    set -e
+    set +x
+    popd
+  else
+    set -x
+    set +e
+    "${BIN}/ginkgo" -p -nodes="${GINKGO_PARALLEL}" \
+      --focus="${GINKGO_FOCUS}" \
+      --skip="${GINKGO_SKIP}" \
+      --junit-report="${JUNIT_REPORT:-${REPORT_DIR}/junit.xml}" \
+      "${TEST_PATH_OVERRIDE:-${TEST_PATH}}" \
+      -- \
+      -kubeconfig="${KUBECONFIG}" \
+      -gce-zone="${FIRST_ZONE}"
+    TEST_PASSED=$?
+    set -e
+    set +x
+  fi
+
+  PODS=$(kubectl get pod -n kube-system -l "app.kubernetes.io/name=aws-ebs-csi-driver" -o json --kubeconfig "${KUBECONFIG}" | jq -r .items[].metadata.name)
+
+  if [[ -n "${PODS}" ]]; then
+    while IFS= read -r POD; do
+      kubectl logs "${POD}" -n kube-system --all-containers --ignore-errors --kubeconfig "${KUBECONFIG}" >"${REPORT_DIR}/${POD}.txt"
+    done <<<"${PODS}"
+  fi
+fi
+
+# Collect periodic performance metrics - this should only run in Prow
+if [[ "${COLLECT_METRICS}" == true ]] && [ -n "${PROW_JOB_ID:-}" ]; then
+  metrics_collector "$KUBECONFIG" \
+    "$AWS_ACCOUNT_ID" \
+    "$AWS_REGION" \
+    "$NODE_OS_DISTRO" \
+    "$deployTimeSeconds" \
+    "aws-ebs-csi-driver" \
+    "$VERSION"
+fi
+
+## Cleanup
+
+if [[ "${HELM_CT_TEST}" != true ]]; then
+  # If there are more than 3 restarts in any single container fail the test and print table with restarts.
+  POD_RESTARTS=$(kubectl get pods -n kube-system -l "app.kubernetes.io/name=aws-ebs-csi-driver" -o json --kubeconfig "${KUBECONFIG}" |
+    jq -r '.items[].status.containerStatuses[]?.restartCount // 0' |
+    sort -nr | head -n 1)
+  if [[ ${POD_RESTARTS} -gt 3 ]]; then
+    loudecho "ERROR: Container restart count exceeds threshold"
+    kubectl get pods -n kube-system -l "app.kubernetes.io/name=aws-ebs-csi-driver" -o custom-columns="POD:.metadata.name,CONTAINER:.spec.containers[*].name,RESTARTS:.status.containerStatuses[*].restartCount" --kubeconfig "${KUBECONFIG}"
+    TEST_PASSED=1
+  fi
+  if [ -z "${SKIP_DRIVER_INSTALL+x}" ]; then
+    uninstall_driver
+  fi
+fi
+
+if [[ "${EBS_INSTALL_SNAPSHOT}" == true ]]; then
+  loudecho "Removing snapshot controller and CRDs"
+  kubectl delete --kubeconfig "${KUBECONFIG}" -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/"${EBS_INSTALL_SNAPSHOT_VERSION}"/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml
+  kubectl delete --kubeconfig "${KUBECONFIG}" -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/"${EBS_INSTALL_SNAPSHOT_VERSION}"/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml
+  kubectl delete --kubeconfig "${KUBECONFIG}" -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/"${EBS_INSTALL_SNAPSHOT_VERSION}"/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml
+  kubectl delete --kubeconfig "${KUBECONFIG}" -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/"${EBS_INSTALL_SNAPSHOT_VERSION}"/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml
+  kubectl delete --kubeconfig "${KUBECONFIG}" -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/"${EBS_INSTALL_SNAPSHOT_VERSION}"/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml
+fi
+
+## Output result
+
+loudecho "TEST_PASSED: ${TEST_PASSED}"
+if [[ $TEST_PASSED -ne 0 ]]; then
+  loudecho "FAIL!"
+  exit 1
+else
+  loudecho "SUCCESS!"
+fi

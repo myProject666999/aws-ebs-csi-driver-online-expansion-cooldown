@@ -1,0 +1,97 @@
+# Copyright 2024 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the 'License');
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an 'AS IS' BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: {{ .Env.CLUSTER_NAME }}
+  region: {{ .Env.REGION }}
+  version: "{{ .Env.K8S_VERSION }}"
+availabilityZones: [{{ .Env.ZONES }}]
+autoModeConfig:
+  enabled: false
+iam:
+  vpcResourceControllerPolicy: true
+{{- if env.Getenv "USE_IRSA" }}
+  withOIDC: true
+  serviceAccounts:
+    - metadata:
+        name: ebs-csi-controller-sa
+        namespace: kube-system
+      wellKnownPolicies:
+        ebsCSIController: true
+{{- else }}
+  podIdentityAssociations:
+    - namespace: kube-system
+      serviceAccountName: ebs-csi-controller-sa
+      wellKnownPolicies:
+        ebsCSIController: true
+addons:
+  - name: eks-pod-identity-agent
+{{- end }}
+managedNodeGroups:
+  - name: ng-linux
+    amiFamily: {{ .Env.AMI_FAMILY }}
+    {{- if env.Getenv "LINUX_AMI" }}
+    ami: {{ .Env.LINUX_AMI }}
+    {{- end }}
+    desiredCapacity: 3
+    # Test against no-IMDS environment to test k8s metadata
+    # and IRSA/Pod Identity support
+    disablePodIMDS: true
+    instanceTypes: [{{ .Env.INSTANCE_TYPE }}]
+    privateNetworking: true
+    ssh:
+      allow: false
+{{- if and (eq .Env.WINDOWS "true") (not (env.Getenv "WINDOWS_AMI")) }}
+  - name: ng-windows
+    amiFamily: WindowsServer2025CoreContainer
+    desiredCapacity: 3
+    disablePodIMDS: true
+    instanceTypes: [m7a.2xlarge]
+    privateNetworking: true
+    ssh:
+      allow: false
+      enableSsm: true
+{{- end }}
+nodeGroups:
+{{- if env.Getenv "OUTPOST_ARN" }}
+  # Outpost nodegroups cannot be managed
+  - name: ng-outpost
+    amiFamily: AmazonLinux2023
+    {{- if env.Getenv "LINUX_AMI" }}
+    ami: {{ .Env.LINUX_AMI }}
+    {{- end }}
+    desiredCapacity: 3
+    # Driver needs access to IMDS on outposts for correct metadata
+    disablePodIMDS: false
+    instanceType: {{ .Env.OUTPOST_INSTANCE_TYPE }}
+    ssh:
+      allow: false
+      enableSsm: true
+    outpostARN: {{ .Env.OUTPOST_ARN }}
+{{- end }}
+{{- if and (eq .Env.WINDOWS "true") (env.Getenv "WINDOWS_AMI") }}
+  # Windows nodegroups with a custom AMI cannot be managed
+  - name: ng-windows
+    amiFamily: WindowsServer2022CoreContainer
+    ami: {{ .Env.WINDOWS_AMI }}
+    desiredCapacity: 3
+    disablePodIMDS: true
+    instanceType: m7a.2xlarge
+    privateNetworking: true
+    ssh:
+      allow: false
+      enableSsm: true
+{{- end }}

@@ -1,0 +1,90 @@
+/*
+Copyright 2018 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+   http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package e2e
+
+import (
+	"flag"
+	"log"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/plugin"
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/util"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"k8s.io/kubernetes/test/e2e/framework"
+	frameworkconfig "k8s.io/kubernetes/test/e2e/framework/config"
+)
+
+const (
+	kubeconfigEnvVar           = "KUBECONFIG"
+	awsSDKUserAgentAppIDEnvVar = "AWS_SDK_UA_APP_ID"
+	e2eUserAgentApplicationID  = "aws-ebs-csi-driver-e2e-dev"
+)
+
+//nolint:gochecknoinits
+func init() {
+	rand.New(rand.NewSource(time.Now().UnixNano()))
+	testing.Init()
+	// k8s.io/kubernetes/test/e2e/framework requires env KUBECONFIG to be set
+	// it does not fall back to defaults
+	if os.Getenv(kubeconfigEnvVar) == "" {
+		kubeconfig := filepath.Join(os.Getenv("HOME"), ".kube", "config")
+		os.Setenv(kubeconfigEnvVar, kubeconfig)
+	}
+	framework.AfterReadingAllFlags(&framework.TestContext)
+
+	frameworkconfig.CopyFlags(frameworkconfig.Flags, flag.CommandLine)
+	framework.RegisterCommonFlags(flag.CommandLine)
+	framework.RegisterClusterFlags(flag.CommandLine)
+	flag.Parse()
+
+	// Set driver name using same method as main.go (to allow E2E testing with plugins)
+	// TODO: Figure out a cleaner way to do this
+	driverName := "ebs.csi.aws.com"
+	if plugin := plugin.GetPlugin(); plugin != nil {
+		if pluginDriverName := plugin.GetDriverName(); pluginDriverName != "" {
+			driverName = pluginDriverName
+		}
+	}
+	util.SetDriverName(driverName)
+}
+
+func TestE2E(t *testing.T) {
+	if err := setE2EUserAgent(); err != nil {
+		t.Fatalf("Failed setting AWS SDK user agent application ID: %v", err)
+	}
+
+	RegisterFailHandler(Fail)
+
+	// Run tests through the Ginkgo runner with output to console + JUnit for Jenkins
+	var r []Reporter
+	if framework.TestContext.ReportDir != "" {
+		// Create the directory if it doesn't already exists
+		// NOTE: junit report can be created with new --junit-report flag
+		// https://github.com/kubernetes/kubernetes/blob/4569e646ef161c0262d433aed324fec97a525572/test/e2e_kubeadm/e2e_kubeadm_suite_test.go
+		if err := os.MkdirAll(framework.TestContext.ReportDir, 0755); err != nil {
+			log.Fatalf("Failed creating report directory: %v", err)
+		}
+	}
+	RunSpecsWithDefaultAndCustomReporters(t, "AWS EBS CSI Driver End-to-End Tests", r)
+}
+
+func setE2EUserAgent() error {
+	return os.Setenv(awsSDKUserAgentAppIDEnvVar, e2eUserAgentApplicationID)
+}

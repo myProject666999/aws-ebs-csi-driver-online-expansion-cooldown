@@ -1,0 +1,407 @@
+# Copyright 2025 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+###
+### This Makefile is documented in docs/makefile.md
+###
+
+## Variables/Functions
+
+VERSION?=v1.68.1
+
+# Retry goproxy pulls on Prow to avoid flaked jobs
+ifneq ($(PROW_JOB_ID),)
+GOPROXY = https://proxy.golang.org|https://proxy.golang.org|https://proxy.golang.org,direct
+endif
+
+PKG=github.com/kubernetes-sigs/aws-ebs-csi-driver
+GIT_COMMIT?=$(shell git rev-parse HEAD)
+BUILD_DATE?=$(shell date -u -Iseconds)
+LDFLAGS?="-X ${PKG}/pkg/driver.driverVersion=${VERSION} -X ${PKG}/pkg/cloud.driverVersion=${VERSION} -X ${PKG}/pkg/driver.gitCommit=${GIT_COMMIT} -X ${PKG}/pkg/driver.buildDate=${BUILD_DATE} -s -w"
+
+OS?=$(shell go env GOHOSTOS)
+ARCH?=$(shell go env GOHOSTARCH)
+ifeq ($(OS),windows)
+	BINARY=aws-ebs-csi-driver.exe
+	OSVERSION?=ltsc2022
+else
+	BINARY=aws-ebs-csi-driver
+	OSVERSION?=al2023
+endif
+
+GO_SOURCES=go.mod go.sum $(shell find pkg cmd -type f -name "*.go")
+
+ALL_OS?=linux windows
+ALL_ARCH_linux?=amd64 arm64
+ALL_OSVERSION_linux?=al2023
+ALL_OS_ARCH_OSVERSION_linux=$(foreach arch, $(ALL_ARCH_linux), $(foreach osversion, ${ALL_OSVERSION_linux}, linux-$(arch)-${osversion}))
+
+ALL_ARCH_windows?=amd64
+ALL_OSVERSION_windows?=ltsc2019 ltsc2022 ltsc2025
+ALL_OS_ARCH_OSVERSION_windows=$(foreach arch, $(ALL_ARCH_windows), $(foreach osversion, ${ALL_OSVERSION_windows}, windows-$(arch)-${osversion}))
+ALL_OS_ARCH_OSVERSION=$(foreach os, $(ALL_OS), ${ALL_OS_ARCH_OSVERSION_${os}})
+
+CLUSTER_NAME?=ebs-csi-e2e.k8s.local
+CLUSTER_TYPE?=kops
+
+GINKGO_WINDOWS_SKIP?="\[Disruptive\]|\[Serial\]|\[Flaky\]|\[LinuxOnly\]|\[Feature:VolumeSnapshotDataSource\]|\(xfs\)|\(ext4\)|\(block volmode\)"
+GINKGO_BOTTLEROCKET_SKIP?="\[Disruptive\]|\[Serial\]|\[Flaky\]|should not mount / map unused volumes in a pod \[LinuxOnly\]"
+GINKGO_FIPS_VOLUME_FOCUS=External.Storage.*\[Testpattern: Dynamic PV \(default fs\)\].*volumes should store data
+GINKGO_FIPS_EXPAND_FOCUS=External.Storage.*\[Testpattern: Dynamic PV \(default fs\)\(allowExpansion\)\].*volume-expand Verify if offline PVC expansion works
+
+# split words on hyphen, access by 1-index
+word-hyphen = $(word $2,$(subst -, ,$1))
+
+.EXPORT_ALL_VARIABLES:
+
+## Default target
+# When no target is supplied, make runs the first target that does not begin with a .
+# Alias that to building the binary
+.PHONY: default
+default: bin/$(BINARY)
+
+## Top level targets
+
+.PHONY: clean
+clean:
+	rm -rf bin/
+
+.PHONY: test
+test:
+	go test -v -race ./cmd/... ./pkg/... ./tests/sanity/...
+
+.PHONY: test/coverage
+test/coverage:
+	go test -coverprofile=cover.out ./cmd/... ./pkg/...
+	grep -v "mock" cover.out > filtered_cover.out
+	go tool cover -html=filtered_cover.out -o coverage.html
+	rm cover.out filtered_cover.out
+
+.PHONY: tools
+tools: bin/aws bin/ct bin/eksctl bin/ginkgo bin/golangci-lint bin/gomplate bin/helm bin/kops bin/kubetest2 bin/kustomize bin/mockgen bin/shfmt
+
+.PHONY: update
+update: update/gofix update/gofmt update/golangci-fix update/kustomize update/mockgen update/gomod update/shfmt update/generate-license-header
+	@echo "All updates succeeded!"
+
+.PHONY: verify
+verify: verify/govet verify/golangci-lint verify/kustomize verify/update verify/volume-limits
+	@echo "All verifications passed!"
+
+.PHONY: cluster/create
+cluster/create: bin/kops bin/eksctl bin/aws bin/gomplate
+	./hack/e2e/create-cluster.sh
+
+.PHONY: cluster/kubeconfig
+cluster/kubeconfig:
+	@./hack/e2e/kubeconfig.sh
+
+.PHONY: cluster/image
+cluster/image: bin/aws
+	./hack/e2e/build-image.sh
+
+.PHONY: cluster/delete
+cluster/delete: bin/kops bin/eksctl
+	./hack/e2e/delete-cluster.sh
+
+.PHONY: cluster/install
+cluster/install: bin/helm bin/aws
+	./hack/e2e/install.sh
+
+.PHONY: cluster/helm
+cluster/helm: bin/helm bin/aws
+	HELM_USE_DEFAULT_IMAGE="true" \
+	./hack/e2e/install.sh
+
+.PHONY: cluster/uninstall
+cluster/uninstall: bin/helm bin/aws
+	./hack/e2e/uninstall.sh
+
+## E2E targets
+# Targets to run e2e tests
+
+.PHONY: test/helm-template
+test/helm-template: bin/helm
+	cd tests/helm-template && go test -v -count=1 ./...
+
+## e2e/parameters and e2e/parameters-all are Parameter-specific e2e tests
+# Usage: make e2e/parameters PARAM_SET=<name> or make e2e/parameters-all
+# See hack/e2e/param-sets.sh for available sets and their definitions.
+ 
+.PHONY: e2e/parameters
+e2e/parameters: bin/helm bin/ginkgo
+	./hack/e2e/param-sets.sh run $(PARAM_SET)
+
+.PHONY: e2e/parameters-all
+e2e/parameters-all: bin/helm bin/ginkgo test/helm-template
+	./hack/e2e/param-sets.sh run-all
+
+.PHONY: e2e/functional
+e2e/functional: bin/helm bin/ginkgo
+	TEST_PATH=./tests/e2e/... \
+	GINKGO_FOCUS="\[ebs-csi-e2e\] \[functional\]" \
+	GINKGO_PARALLEL=5 \
+	HELM_EXTRA_FLAGS="--set=controller.volumeModificationFeature.enabled=true,sidecars.provisioner.additionalArgs[0]='--feature-gates=VolumeAttributesClass=true',sidecars.resizer.additionalArgs[0]='--feature-gates=VolumeAttributesClass=true',node.enableMetrics=true" \
+	./hack/e2e/run.sh
+
+.PHONY: e2e/disruptive
+e2e/disruptive: bin/helm bin/ginkgo
+	TEST_PATH=./tests/e2e/... \
+	GINKGO_FOCUS="\[ebs-csi-e2e\] \[Disruptive\]" \
+	GINKGO_SKIP="\[Flaky\]" \
+	GINKGO_PARALLEL=1 \
+	EBS_INSTALL_SNAPSHOT=false \
+	CREATE_MISSING_FIS_ROLE=true \
+	HELM_EXTRA_FLAGS="--set=sidecars.metadataLabeler.enabled=true,node.metadataSources='metadata-labeler',sidecars.healthMonitor.enabled=true,sidecars.healthMonitor.additionalArgs[0]='--list-volumes-interval=1m'" \
+	./hack/e2e/run.sh
+
+.PHONY: e2e/external
+e2e/external: bin/helm bin/kubetest2
+	COLLECT_METRICS="true" \
+	./hack/e2e/run.sh
+
+.PHONY: e2e/external-eks-bottlerocket
+e2e/external-eks-bottlerocket: bin/helm bin/kubetest2
+	GINKGO_SKIP=$(GINKGO_BOTTLEROCKET_SKIP) \
+	./hack/e2e/run.sh
+
+.PHONY: e2e/external-fips
+e2e/external-fips: bin/helm bin/kubetest2
+	GINKGO_FOCUS="$(GINKGO_FIPS_VOLUME_FOCUS)|$(GINKGO_FIPS_EXPAND_FOCUS)" \
+	EBS_INSTALL_SNAPSHOT=false \
+	HELM_EXTRA_FLAGS="--set=fips=true,sidecars.metadataLabeler.enabled=true" \
+	./hack/e2e/run.sh
+
+.PHONY: e2e/external-windows
+e2e/external-windows: bin/helm bin/kubetest2
+	WINDOWS=true \
+	GINKGO_SKIP=$(GINKGO_WINDOWS_SKIP) \
+	GINKGO_PARALLEL=15 \
+	EBS_INSTALL_SNAPSHOT="false" \
+	./hack/e2e/run.sh
+
+.PHONY: e2e/external-windows-fips
+e2e/external-windows-fips: bin/helm bin/kubetest2
+	WINDOWS=true \
+	GINKGO_FOCUS="$(GINKGO_FIPS_VOLUME_FOCUS)" \
+	GINKGO_WINDOWS_VOLUME_EXPAND_FOCUS="$(GINKGO_FIPS_EXPAND_FOCUS)" \
+	GINKGO_SKIP=$(GINKGO_WINDOWS_SKIP) \
+	EBS_INSTALL_SNAPSHOT="false" \
+	HELM_EXTRA_FLAGS="--set=fips=true,sidecars.metadataLabeler.enabled=true" \
+	./hack/e2e/run.sh
+
+.PHONY: e2e/external-windows-hostprocess
+e2e/external-windows-hostprocess: bin/helm bin/kubetest2
+	WINDOWS_HOSTPROCESS=true \
+	WINDOWS=true \
+	GINKGO_SKIP=$(GINKGO_WINDOWS_SKIP) \
+	GINKGO_PARALLEL=15 \
+	EBS_INSTALL_SNAPSHOT="false" \
+	./hack/e2e/run.sh
+
+.PHONY: e2e/external-kustomize
+e2e/external-kustomize: bin/kubetest2
+	DEPLOY_METHOD="kustomize" \
+	./hack/e2e/run.sh
+
+.PHONY: e2e/helm-ct
+e2e/helm-ct: bin/helm bin/ct
+	HELM_CT_TEST="true" \
+	./hack/e2e/run.sh
+
+## Release scripts
+# Targets run as part of performing a release
+
+.PHONY: update-truth-sidecars
+update-truth-sidecars: hack/release-scripts/get-latest-sidecar-images
+	./hack/release-scripts/get-latest-sidecar-images
+
+.PHONY: generate-sidecar-tags
+generate-sidecar-tags: update-truth-sidecars charts/aws-ebs-csi-driver/values.yaml deploy/kubernetes/overlays/stable/gcr/kustomization.yaml hack/release-scripts/generate-sidecar-tags
+	./hack/release-scripts/generate-sidecar-tags
+
+.PHONY: update-sidecar-dependencies
+update-sidecar-dependencies: update-truth-sidecars generate-sidecar-tags update/kustomize
+
+.PHONY: update-image-dependencies
+update-image-dependencies: update-sidecar-dependencies
+	./hack/release-scripts/update-e2e-images
+
+.PHONY: update-ci-dependencies
+update-ci-dependencies:
+	./hack/update-ci-dependencies
+
+# Prepare a release: upgrade Go and Go dependencies, refresh Dockerfile base
+# image and sidecar digests/tags, regenerate all generated files, and run unit
+# tests and the vulnerability scan. Leaves a diff ready to be committed.
+.PHONY: pre-release
+pre-release:
+	go get -u ./... go@latest
+	go -C ./tests/e2e get -u ./... go@latest
+	./hack/release-scripts/update-base-images
+	$(MAKE) update-sidecar-dependencies
+	$(MAKE) update
+	$(MAKE) test
+	$(MAKE) verify
+	$(MAKE) security
+	@echo "Pre-release updates succeeded! Review the diff and commit it as the release PR."
+
+# Generate the post-release PR file changes and draft changelog
+# entries for the driver and the helm chart.
+# Usage: make post-release NEW_VERSION=v1.64.0
+.PHONY: post-release
+post-release: bin/release-notes hack/release-scripts/generate-release-pr hack/release-scripts/generate-changelog
+ifndef NEW_VERSION
+	$(error NEW_VERSION is required, e.g. make post-release NEW_VERSION=v1.64.0)
+endif
+ifndef GITHUB_TOKEN
+	$(error GITHUB_TOKEN is required to generate the changelog (a GitHub token with repo read access))
+endif
+	./hack/release-scripts/generate-release-pr $(VERSION) $(NEW_VERSION)
+	./hack/release-scripts/generate-changelog $(VERSION) $(NEW_VERSION)
+
+.PHONY: security
+security: bin/govulncheck
+	./hack/tools/check-security.sh
+
+## CI aliases
+# Targets intended to be executed mostly or only by CI jobs
+
+.PHONY: sub-push
+sub-push: all-image-registry push-manifest
+
+.PHONY: all-push
+all-push: sub-push
+
+test-e2e-%:
+	./hack/prow-e2e.sh test-e2e-$*
+
+test-helm-chart:
+	./hack/prow-e2e.sh test-helm-chart
+
+## Builds
+
+bin:
+	@mkdir -p $@
+
+bin/$(BINARY): $(GO_SOURCES) | bin
+	CGO_ENABLED=0 GOOS=$(OS) GOARCH=$(ARCH) GOFIPS140=$(GOFIPS140) go build -mod=readonly -ldflags ${LDFLAGS} -o $@ ./cmd/
+
+.PHONY: all-image-registry
+all-image-registry: $(addprefix sub-image-,$(ALL_OS_ARCH_OSVERSION))
+
+sub-image-%:
+	$(MAKE) OS=$(call word-hyphen,$*,1) ARCH=$(call word-hyphen,$*,2) OSVERSION=$(call word-hyphen,$*,3) image
+
+.PHONY: image
+image:
+	BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker buildx build \
+		--platform="$(OS)/$(ARCH)" \
+		--progress=plain \
+		--target="$(OS)-$(OSVERSION)" \
+		--output=type=registry \
+		-t="$(IMAGE):$(TAG)-$(OS)-$(ARCH)-$(OSVERSION)" \
+		--build-arg="GOPROXY=$(GOPROXY)" \
+		--build-arg="VERSION=$(VERSION)" \
+		$(DOCKER_EXTRA_ARGS) \
+		.
+
+.PHONY: create-manifest
+create-manifest: all-image-registry
+	docker manifest create --amend "$(IMAGE):$(TAG)" $(foreach variant,$(ALL_OS_ARCH_OSVERSION),"$(IMAGE):$(TAG)-$(variant)")
+
+.PHONY: push-manifest
+push-manifest: create-manifest
+	docker manifest push --purge "$(IMAGE):$(TAG)"
+
+## Helm chart
+# Package the Helm chart and push it to the staging OCI registry.
+# Invoked by hack/cloudbuild.sh on helm-chart tags.
+
+.PHONY: helm-chart-push
+helm-chart-push: bin/helm
+	./hack/helm-chart-package.sh
+
+## Tools
+# Tools necessary to perform other targets
+
+bin/%: hack/tools/install.sh hack/tools/python-runner.sh
+	@TOOLS_PATH="$(shell pwd)/bin" ./hack/tools/install.sh $*
+
+## Updaters
+# Automatic generators/formatters for code
+
+.PHONY: update/gofix
+update/gofix:
+	go fix ./...
+
+.PHONY: update/gofmt
+update/gofmt:
+	gofmt -s -w .
+
+.PHONY: update/golangci-fix
+update/golangci-fix: bin/golangci-lint
+ifndef SKIP_GOLANGCI_FIX
+	./bin/golangci-lint run --fix ./... || true
+endif
+
+.PHONY: update/kustomize
+update/kustomize: bin/helm
+	./hack/update-kustomize.sh
+
+.PHONY: update/mockgen
+update/mockgen: bin/mockgen
+	./hack/update-mockgen.sh
+
+.PHONY: update/gomod
+update/gomod:
+	go mod tidy
+	go mod tidy -C tests/e2e/
+
+.PHONY: update/shfmt
+update/shfmt: bin/shfmt
+	./bin/shfmt -w -i 2 -d ./hack/
+
+.PHONY: update/generate-license-header
+update/generate-license-header:
+	./hack/generate-license-header.sh
+
+.PHONY: generate-volume-limits-table
+generate-volume-limits-table:
+	go run ./hack/generate-volume-limits-table > pkg/cloud/limits/volume_limits_table.go
+	gofmt -s -w pkg/cloud/limits/volume_limits_table.go
+	go run ./hack/detect-potentially-invalid-limits
+
+## Verifiers
+# Linters and similar
+
+.PHONY: verify/golangci-lint
+verify/golangci-lint: bin/golangci-lint
+	./bin/golangci-lint run --timeout=10m --verbose
+
+.PHONY: verify/govet
+verify/govet:
+	go vet $$(go list ./...)
+
+.PHONY: verify/kustomize
+verify/kustomize: bin/kustomize
+	./hack/verify-kustomize.sh
+
+.PHONY: verify/update
+verify/update: bin/helm bin/mockgen
+	./hack/verify-update.sh
+
+.PHONY: verify/volume-limits
+verify/volume-limits:
+	go run ./hack/detect-potentially-invalid-limits
