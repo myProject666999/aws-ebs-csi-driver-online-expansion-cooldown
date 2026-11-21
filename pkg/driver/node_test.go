@@ -2454,6 +2454,83 @@ func TestNodeExpandVolume(t *testing.T) {
 			expectedErr:  status.Error(codes.Internal, "failed to get block capacity on path /volume/path: failed to get block size"),
 		},
 		{
+			name: "filesystem_device_smaller_than_required_returns_retryable_error",
+			req: &csi.NodeExpandVolumeRequest{
+				VolumeId:   "vol-test",
+				VolumePath: "/volume/path",
+				CapacityRange: &csi.CapacityRange{
+					RequiredBytes: 2000,
+				},
+			},
+			mounterMock: func(ctrl *gomock.Controller) *mounter.MockMounter {
+				m := mounter.NewMockMounter(ctrl)
+				m.EXPECT().IsBlockDevice(gomock.Eq("/volume/path")).Return(false, nil)
+				m.EXPECT().GetDeviceNameFromMount(gomock.Eq("/volume/path")).Return("device-name", 1, nil)
+				m.EXPECT().FindDevicePath(gomock.Eq("device-name"), gomock.Eq("vol-test"), gomock.Eq(""), gomock.Eq("us-west-2")).Return("/dev/xvdba", nil)
+				m.EXPECT().Resize(gomock.Eq("/dev/xvdba"), gomock.Eq("/volume/path")).Return(true, nil)
+				m.EXPECT().GetBlockSizeBytes(gomock.Eq("/dev/xvdba")).Return(int64(1000), nil)
+				return m
+			},
+			metadataMock: func(ctrl *gomock.Controller) *metadata.MockMetadataService {
+				m := metadata.NewMockMetadataService(ctrl)
+				m.EXPECT().GetRegion().Return("us-west-2")
+				return m
+			},
+			expectedErr: status.Error(codes.ResourceExhausted, "volume \"vol-test\" at \"/dev/xvdba\" is 1000 bytes, still smaller than the required 2000 bytes; retrying"),
+		},
+		{
+			name: "filesystem_device_equal_to_required_succeeds",
+			req: &csi.NodeExpandVolumeRequest{
+				VolumeId:   "vol-test",
+				VolumePath: "/volume/path",
+				CapacityRange: &csi.CapacityRange{
+					RequiredBytes: 1000,
+				},
+			},
+			mounterMock: func(ctrl *gomock.Controller) *mounter.MockMounter {
+				m := mounter.NewMockMounter(ctrl)
+				m.EXPECT().IsBlockDevice(gomock.Eq("/volume/path")).Return(false, nil)
+				m.EXPECT().GetDeviceNameFromMount(gomock.Eq("/volume/path")).Return("device-name", 1, nil)
+				m.EXPECT().FindDevicePath(gomock.Eq("device-name"), gomock.Eq("vol-test"), gomock.Eq(""), gomock.Eq("us-west-2")).Return("/dev/xvdba", nil)
+				m.EXPECT().Resize(gomock.Eq("/dev/xvdba"), gomock.Eq("/volume/path")).Return(true, nil)
+				m.EXPECT().GetBlockSizeBytes(gomock.Eq("/dev/xvdba")).Return(int64(1000), nil)
+				return m
+			},
+			metadataMock: func(ctrl *gomock.Controller) *metadata.MockMetadataService {
+				m := metadata.NewMockMetadataService(ctrl)
+				m.EXPECT().GetRegion().Return("us-west-2")
+				return m
+			},
+			expectedResp: &csi.NodeExpandVolumeResponse{CapacityBytes: 1000},
+		},
+		{
+			name: "filesystem_device_larger_than_required_is_not_an_error",
+			req: &csi.NodeExpandVolumeRequest{
+				VolumeId:   "vol-test",
+				VolumePath: "/volume/path",
+				CapacityRange: &csi.CapacityRange{
+					RequiredBytes: 1000,
+					LimitBytes:    1000,
+				},
+			},
+			mounterMock: func(ctrl *gomock.Controller) *mounter.MockMounter {
+				m := mounter.NewMockMounter(ctrl)
+				m.EXPECT().IsBlockDevice(gomock.Eq("/volume/path")).Return(false, nil)
+				m.EXPECT().GetDeviceNameFromMount(gomock.Eq("/volume/path")).Return("device-name", 1, nil)
+				m.EXPECT().FindDevicePath(gomock.Eq("device-name"), gomock.Eq("vol-test"), gomock.Eq(""), gomock.Eq("us-west-2")).Return("/dev/xvdba", nil)
+				m.EXPECT().Resize(gomock.Eq("/dev/xvdba"), gomock.Eq("/volume/path")).Return(true, nil)
+				// Larger than both the required and the limit, and still must not error.
+				m.EXPECT().GetBlockSizeBytes(gomock.Eq("/dev/xvdba")).Return(int64(4000), nil)
+				return m
+			},
+			metadataMock: func(ctrl *gomock.Controller) *metadata.MockMetadataService {
+				m := metadata.NewMockMetadataService(ctrl)
+				m.EXPECT().GetRegion().Return("us-west-2")
+				return m
+			},
+			expectedResp: &csi.NodeExpandVolumeResponse{CapacityBytes: 4000},
+		},
+		{
 			name: "operation_already_exists",
 			req: &csi.NodeExpandVolumeRequest{
 				VolumeId:   "vol-test",

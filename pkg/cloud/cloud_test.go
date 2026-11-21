@@ -44,6 +44,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/utils/clock"
 )
 
 const (
@@ -709,6 +710,54 @@ func TestCheckDesiredState(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestWaitForVolumeModification(t *testing.T) {
+	t.Run("polls until the modification finishes, advancing virtual time instead of sleeping", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			mockEC2 := NewMockEC2API(mockCtrl)
+			c := newCloud(mockEC2)
+			// Two steps: poll, wait one second, then poll again. The wait is virtual, so
+			// this costs no wall clock time.
+			c.(*cloud).vwp.modificationBackoff = wait.Backoff{Duration: time.Second, Factor: 1, Steps: 2}
+
+			gomock.InOrder(
+				mockEC2.EXPECT().DescribeVolumesModifications(testutil.AnyContext(), testutil.EC2Input(&ec2.DescribeVolumesModificationsInput{}), testutil.EC2Options()).Return(&ec2.DescribeVolumesModificationsOutput{
+					VolumesModifications: []types.VolumeModification{{
+						VolumeId:          aws.String("vol-test"),
+						ModificationState: types.VolumeModificationStateModifying,
+					}},
+				}, nil),
+				mockEC2.EXPECT().DescribeVolumesModifications(testutil.AnyContext(), testutil.EC2Input(&ec2.DescribeVolumesModificationsInput{}), testutil.EC2Options()).Return(&ec2.DescribeVolumesModificationsOutput{
+					VolumesModifications: []types.VolumeModification{{
+						VolumeId:          aws.String("vol-test"),
+						ModificationState: types.VolumeModificationStateOptimizing,
+					}},
+				}, nil),
+			)
+
+			require.NoError(t, c.(*cloud).waitForVolumeModification(t.Context(), "vol-test"))
+		})
+	})
+
+	t.Run("returns ErrWaitTimeout when the modification never finishes", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			mockEC2 := NewMockEC2API(mockCtrl)
+			c := newCloud(mockEC2)
+			c.(*cloud).vwp.modificationBackoff = wait.Backoff{Duration: time.Second, Factor: 1, Steps: 2}
+
+			mockEC2.EXPECT().DescribeVolumesModifications(testutil.AnyContext(), testutil.EC2Input(&ec2.DescribeVolumesModificationsInput{}), testutil.EC2Options()).Return(&ec2.DescribeVolumesModificationsOutput{
+				VolumesModifications: []types.VolumeModification{{
+					VolumeId:          aws.String("vol-test"),
+					ModificationState: types.VolumeModificationStateModifying,
+				}},
+			}, nil).Times(2)
+
+			require.ErrorIs(t, c.(*cloud).waitForVolumeModification(t.Context(), "vol-test"), wait.ErrWaitTimeout)
+		})
+	})
 }
 
 func TestBatchDescribeVolumesModifications(t *testing.T) {
@@ -3805,6 +3854,7 @@ func TestResizeOrModifyDisk(t *testing.T) {
 		reqSizeGiB          int32
 		modifyDiskOptions   *ModifyDiskOptions
 		expErr              error
+		expNotReadyErr      error
 		shouldCallDescribe  bool
 	}{
 		{
@@ -4061,6 +4111,55 @@ func TestResizeOrModifyDisk(t *testing.T) {
 			},
 			shouldCallDescribe: true,
 		},
+		{
+			name:     "failure: ModifyVolume rejected with VolumeModificationRateExceeded (cooldown)",
+			volumeID: "vol-test",
+			existingVolume: &types.Volume{
+				VolumeId:         aws.String("vol-test"),
+				AvailabilityZone: aws.String(defaultZone),
+				VolumeType:       types.VolumeTypeGp3,
+				Size:             aws.Int32(100),
+			},
+			modifiedVolumeError: &smithy.GenericAPIError{Code: "VolumeModificationRateExceeded", Message: "volume modification rate exceeded"},
+			reqSizeGiB:          200,
+			modifyDiskOptions:   &ModifyDiskOptions{},
+			expNotReadyErr:      ErrVolumeModificationRateExceeded,
+		},
+		{
+			name:     "failure: previous modification still optimizing",
+			volumeID: "vol-test",
+			existingVolume: &types.Volume{
+				VolumeId:         aws.String("vol-test"),
+				AvailabilityZone: aws.String(defaultZone),
+				VolumeType:       types.VolumeTypeGp3,
+				Size:             aws.Int32(100),
+			},
+			descModVolume: &ec2.DescribeVolumesModificationsOutput{
+				VolumesModifications: []types.VolumeModification{
+					{
+						VolumeId:          aws.String("vol-test"),
+						TargetSize:        aws.Int32(100),
+						ModificationState: types.VolumeModificationStateOptimizing,
+					},
+				},
+			},
+			reqSizeGiB:        300,
+			modifyDiskOptions: &ModifyDiskOptions{},
+			expNotReadyErr:    ErrVolumeModificationInProgress,
+		},
+		{
+			name:     "success: duplicate expansion to current capacity is a no-op",
+			volumeID: "vol-test",
+			existingVolume: &types.Volume{
+				VolumeId:         aws.String("vol-test"),
+				AvailabilityZone: aws.String(defaultZone),
+				VolumeType:       types.VolumeTypeGp3,
+				Size:             aws.Int32(200),
+			},
+			reqSizeGiB:         200,
+			modifyDiskOptions:  &ModifyDiskOptions{},
+			shouldCallDescribe: true,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -4120,6 +4219,13 @@ func TestResizeOrModifyDisk(t *testing.T) {
 
 			newSize, err := c.ResizeOrModifyDisk(ctx, tc.volumeID, util.GiBToBytes(tc.reqSizeGiB), tc.modifyDiskOptions)
 			switch {
+			case tc.expNotReadyErr != nil:
+				require.ErrorIs(t, err, tc.expNotReadyErr)
+				var modErr *VolumeModificationError
+				require.ErrorAs(t, err, &modErr, "expected a typed VolumeModificationError")
+				assert.Equal(t, tc.volumeID, modErr.VolumeID)
+				assert.Equal(t, tc.reqSizeGiB, modErr.RequestedSizeGiB)
+				assert.Nil(t, modErr.CooldownRemaining, "cooldown must only be set when the cloud reports it")
 			case errors.Is(tc.expErr, ErrInvalidArgument):
 				require.ErrorIs(t, err, ErrInvalidArgument, "ResizeOrModifyDisk() should return ErrInvalidArgument")
 			case tc.expErr != nil:
@@ -5866,6 +5972,7 @@ func newCloud(mockEC2 util.EC2API) Cloud {
 		volumeInitializations: expiringcache.New[string, volumeInitialization](cacheForgetDelay),
 		latestIOPSLimits:      expiringcache.New[string, iopsLimits](iopsLimitCacheForgetDelay),
 		cardCountCache:        expiringcache.New[string, int](cacheForgetDelay),
+		clock:                 clock.RealClock{},
 	}
 	return c
 }

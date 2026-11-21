@@ -426,6 +426,36 @@ sequenceDiagram
     end
 ```
 
+### Modification cooldown and in-flight modifications
+
+EC2 rejects a `ModifyVolume` call when the volume is still inside its modification cooldown (returned as `VolumeModificationRateExceeded`) or when a previous modification of the same volume is still in the `optimizing` state. Both conditions clear on their own, so the driver does not sleep or block them internally; it surfaces a stable error and leaves the retry to the caller (external-resizer or volume-modifier-for-k8s).
+
+`cloud.ResizeOrModifyDisk` returns a `*cloud.VolumeModificationError` wrapping one of two sentinels:
+
+| Sentinel | Condition |
+|----------|-----------|
+| `cloud.ErrVolumeModificationRateExceeded` | EC2 rejected `ModifyVolume` with `VolumeModificationRateExceeded` (cooldown). |
+| `cloud.ErrVolumeModificationInProgress` | A `DescribeVolumesModifications` check found the volume in `optimizing`. |
+
+The same classification is produced by the pre-existing cloud-state check (via `getVolumeModificationState`) and by the final rejection of `ModifyVolume`, so a caller cannot tell which path produced it. The error message includes the volume ID, the requested capacity, the current capacity, and the reported modification state. The remaining cooldown time is only included when the cloud provider actually reports it; the driver never guesses it or caches the last modification time, so a restart cannot lose the cooldown and local clock skew cannot fabricate one.
+
+Because `ControllerExpandVolume` and `ControllerModifyVolume` share the same per-volume coalescer, a merged size+attribute request that is rejected returns the same class of error to every waiting caller. Both RPCs map these errors to `RESOURCE_EXHAUSTED`:
+
+- CSI reserves `ABORTED` for "operation pending for volume" (a duplicate concurrent call), which this driver already uses for its own in-flight conflicts. Reusing `ABORTED` for a cloud-side cooldown would be indistinguishable from that.
+- `RESOURCE_EXHAUSTED` ("server temporarily out of resources") describes a volume whose modification capacity is temporarily unavailable.
+- external-resizer's `IsFinalError` treats both `ABORTED` and `RESOURCE_EXHAUSTED` as non-final and retries with exponential backoff, so `RESOURCE_EXHAUSTED` yields the desired retry without misusing `ABORTED`.
+
+Capacity edge cases:
+
+- A `required_bytes` at or below the current capacity is a no-op: `needsVolumeModification` is false, no `ModifyVolume` is issued, and the current capacity is returned as success (CSI permits returning the current capacity when the request is already satisfied). EBS cannot shrink a volume.
+- A controller `limit_bytes` below the current capacity is `OUT_OF_RANGE` (the caller must fix the range). This is separate from the node phase, where a device larger than the request is not an error.
+
+### Two-phase handoff
+
+`ControllerExpandVolume` sets `node_expansion_required` from the request's `VolumeCapability`: it is `false` for a raw block device and `true` otherwise (including when no capability is provided). When the node phase runs for a filesystem volume, `NodeExpandVolume` resizes the filesystem and then compares the resulting device size with the requested `CapacityRange.RequiredBytes`. If the device is still smaller, it returns a retryable `RESOURCE_EXHAUSTED` instead of reporting a false success; a device larger than the request is never an error. This means an existing PVC whose node expansion previously "succeeded" while the device lagged behind will now retry until the device catches up.
+
+If the controller succeeds but the node keeps failing, the cloud volume is not rolled back (EBS cannot shrink); PVC status remains managed by external-resizer.
+
 ## Driver modes
 
 Traditionally, you run the CSI controllers together with the EBS driver in the same Kubernetes cluster.

@@ -48,6 +48,7 @@ import (
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/util"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 )
 
 // AWS volume types.
@@ -215,7 +216,70 @@ var (
 
 	// ErrLimitExceeded is returned if a user exceeds a quota.
 	ErrLimitExceeded = errors.New("limit exceeded")
+
+	// ErrVolumeModificationRateExceeded is returned when the cloud provider rejects a
+	// ModifyVolume call because the volume is still inside its modification cooldown
+	// window (for example EC2's VolumeModificationRateExceeded).
+	ErrVolumeModificationRateExceeded = errors.New("volume modification rate exceeded")
+
+	// ErrVolumeModificationInProgress is returned when the volume still has an in-flight
+	// modification (for example an EC2 modification in the "optimizing" state), so a new
+	// modification cannot be submitted yet.
+	ErrVolumeModificationInProgress = errors.New("volume modification already in progress")
 )
+
+// VolumeModificationError carries the context of a volume modification that the cloud
+// provider refused or could not complete. It wraps one of the modification sentinel
+// errors (ErrVolumeModificationRateExceeded or ErrVolumeModificationInProgress) so that
+// callers can classify the failure with errors.Is without parsing the message.
+type VolumeModificationError struct {
+	VolumeID          string
+	RequestedSizeGiB  int32
+	CurrentSizeGiB    int32
+	ModificationState string
+	// CooldownRemaining is only populated when the cloud provider itself reports how
+	// much of the modification cooldown is left. It is left nil otherwise so that the
+	// driver never guesses a cooldown window it was not told about.
+	CooldownRemaining *time.Duration
+	// Err is the sentinel classifying this failure.
+	Err error
+	// Cause is the raw cloud provider error, when there is one, kept for logging.
+	Cause error
+}
+
+func (e *VolumeModificationError) Error() string {
+	msg := fmt.Sprintf("volume %q modification state %q (requested %d GiB, current %d GiB): %v",
+		e.VolumeID, e.ModificationState, e.RequestedSizeGiB, e.CurrentSizeGiB, e.Err)
+	if e.CooldownRemaining != nil {
+		msg = fmt.Sprintf("%s (cooldown remaining %s)", msg, e.CooldownRemaining.Round(time.Second))
+	}
+	if e.Cause != nil {
+		msg = fmt.Sprintf("%s: %v", msg, e.Cause)
+	}
+	return msg
+}
+
+// Unwrap exposes the wrapped sentinel so errors.Is works.
+func (e *VolumeModificationError) Unwrap() error {
+	return e.Err
+}
+
+// newVolumeModificationError builds the typed error, defaulting the modification state
+// to "unknown" when the provider did not report one. cause carries the raw cloud
+// provider error, if any, for logging.
+func newVolumeModificationError(volumeID string, requestedSizeGiB, currentSizeGiB int32, state string, err, cause error) *VolumeModificationError {
+	if state == "" {
+		state = "unknown"
+	}
+	return &VolumeModificationError{
+		VolumeID:          volumeID,
+		RequestedSizeGiB:  requestedSizeGiB,
+		CurrentSizeGiB:    currentSizeGiB,
+		ModificationState: state,
+		Err:               err,
+		Cause:             cause,
+	}
+}
 
 // Set during build time via -ldflags.
 var driverVersion string
@@ -436,6 +500,9 @@ type cloud struct {
 	accountID             string
 	accountIDOnce         sync.Once
 	attemptDryRun         atomic.Bool
+	// clock is only used to time how long waitForVolumeModification polls the cloud
+	// provider. Tests inject a fake clock so they can advance time instead of sleeping.
+	clock clock.Clock
 }
 
 var _ Cloud = &cloud{}
@@ -528,6 +595,7 @@ func NewCloud(region string, awsSdkDebugLog bool, userAgentExtra string, batchin
 		volumeInitializations: expiringcache.New[string, volumeInitialization](volInitCacheForgetDelay),
 		latestIOPSLimits:      expiringcache.New[string, iopsLimits](iopsLimitCacheForgetDelay),
 		cardCountCache:        expiringcache.New[string, int](cacheForgetDelay),
+		clock:                 clock.RealClock{},
 	}
 
 	// Ensure an EC2 Dry-run API call is made on startup and every dryRunInterval
@@ -1161,6 +1229,12 @@ func (c *cloud) ResizeOrModifyDisk(ctx context.Context, volumeID string, newSize
 		}
 		if isAwsErrorMaxIOPSLimitExceeded(err) {
 			return 0, fmt.Errorf("%w: %w", ErrLimitExceeded, err)
+		}
+		if isAWSErrorVolumeModificationRateExceeded(err) {
+			// The volume is still cooling down from a previous modification. Surface a
+			// stable, identifiable error so the controller can return a retryable gRPC
+			// code and let external-resizer back off instead of waiting inside the driver.
+			return 0, newVolumeModificationError(volumeID, newSizeGiB, *volume.Size, "", ErrVolumeModificationRateExceeded, err)
 		}
 		return 0, err
 	}
@@ -2748,6 +2822,14 @@ func isAWSErrorVolumeModificationSizeLimitExceeded(err error) bool {
 	return isAWSError(err, "VolumeModificationSizeLimitExceeded")
 }
 
+// isAWSErrorVolumeModificationRateExceeded checks if the error is a VolumeModificationRateExceeded error.
+// This error is reported when a volume has already been modified too often and is still
+// inside its modification cooldown window, so any further modification is rejected until
+// the cooldown ends.
+func isAWSErrorVolumeModificationRateExceeded(err error) bool {
+	return isAWSError(err, "VolumeModificationRateExceeded")
+}
+
 // isAWSErrorVolumeLimitExceeded checks if the error is a VolumeLimitExceeded error.
 // This error is reported when the limit on the amount of volume storage is exceeded.
 func isAWSErrorVolumeLimitExceeded(err error) bool {
@@ -2779,6 +2861,10 @@ func isAWSErrorInvalidParameter(err error) bool {
 // Checks for desired size on volume by also verifying volume size by describing volume.
 // This is to get around potential eventual consistency problems with describing volume modifications
 // objects and ensuring that we read two different objects to verify volume state.
+//
+// A desired size smaller than the current size counts as satisfied: EBS cannot shrink a
+// volume, and CSI allows a plugin to return the current capacity when the requested one is
+// already met. In that case this returns success with the volume's current size.
 func (c *cloud) checkDesiredState(ctx context.Context, volumeID string, desiredSizeGiB int32, options *ModifyDiskOptions) (int32, error) {
 	request := &ec2.DescribeVolumesInput{
 		VolumeIds: []string{volumeID},
@@ -2808,29 +2894,46 @@ func (c *cloud) checkDesiredState(ctx context.Context, volumeID string, desiredS
 }
 
 // waitForVolumeModification waits for a volume modification to finish.
+//
+// It mirrors wait.ExponentialBackoff but sleeps on c.clock so tests can advance time
+// instead of really sleeping. It polls getLatestVolumeModification, stopping as soon as a
+// modification is done, an error occurs, or the backoff steps are exhausted.
 func (c *cloud) waitForVolumeModification(ctx context.Context, volumeID string) error {
-	waitErr := wait.ExponentialBackoff(c.vwp.modificationBackoff, func() (bool, error) {
-		m, err := c.getLatestVolumeModification(ctx, volumeID, true)
-		// Consider volumes that have never been modified as done
-		if err != nil && errors.Is(err, ErrVolumeNotBeingModified) {
-			return true, nil
-		} else if err != nil {
-			return false, err
-		}
-
-		state := string(m.ModificationState)
-		if volumeModificationDone(state) {
-			return true, nil
-		}
-
-		return false, nil
-	})
-
-	if waitErr != nil {
-		return waitErr
+	clk := c.clock
+	if clk == nil {
+		clk = clock.RealClock{}
 	}
+	backoff := c.vwp.modificationBackoff
+	for backoff.Steps > 0 {
+		done, err := c.volumeModificationDone(ctx, volumeID)
+		if err != nil || done {
+			return err
+		}
+		if backoff.Steps == 1 {
+			break
+		}
+		delay := backoff.Step()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-clk.After(delay):
+		}
+	}
+	return wait.ErrWaitTimeout
+}
 
-	return nil
+// volumeModificationDone checks a single time whether the volume's latest modification
+// is finished. It returns done=true and no error when the volume has never been
+// modified.
+func (c *cloud) volumeModificationDone(ctx context.Context, volumeID string) (bool, error) {
+	m, err := c.getLatestVolumeModification(ctx, volumeID, true)
+	// Consider volumes that have never been modified as done
+	if err != nil && errors.Is(err, ErrVolumeNotBeingModified) {
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	return volumeModificationDone(string(m.ModificationState)), nil
 }
 
 func describeVolumesModifications(ctx context.Context, svc util.EC2API, request *ec2.DescribeVolumesModificationsInput) ([]types.VolumeModification, error) {
@@ -3025,7 +3128,11 @@ func (c *cloud) validateModifyVolume(ctx context.Context, volumeID string, newSi
 	}
 
 	if latestMod != nil && string(latestMod.ModificationState) == string(types.VolumeModificationStateOptimizing) {
-		return true, 0, fmt.Errorf("volume %q in OPTIMIZING state, cannot currently modify", volumeID)
+		// The volume finished modifying but is still optimizing, so EC2 treats it as
+		// having an in-flight modification and rejects a new one. Return the same
+		// class of error (and thus the same gRPC code) as the ModifyVolume rate-limit
+		// rejection so both paths are handled identically by the caller.
+		return true, 0, newVolumeModificationError(volumeID, newSizeGiB, oldSizeGiB, string(latestMod.ModificationState), ErrVolumeModificationInProgress, nil)
 	}
 
 	return true, 0, nil

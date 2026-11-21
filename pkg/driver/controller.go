@@ -722,7 +722,23 @@ func (d *ControllerService) ControllerExpandVolume(ctx context.Context, req *csi
 		newSize: newSize,
 	})
 	if err != nil {
+		// Preserve the gRPC code chosen by the modify-volume executor (for example a
+		// ResourceExhausted returned for a cloud modification cooldown) so the caller can
+		// distinguish a retryable "not ready yet" from an internal failure. Errors that
+		// carry no code (such as coalescer merge conflicts) remain Internal.
+		if code := status.Code(err); code != codes.Unknown && code != codes.OK {
+			return nil, status.Errorf(code, "Could not resize volume %q: %v", volumeID, err)
+		}
 		return nil, status.Errorf(codes.Internal, "Could not resize volume %q: %v", volumeID, err)
+	}
+
+	// A request can ask for a limit that is below the volume's current (already larger)
+	// capacity. No modification is needed in that case, but the capacity range itself is
+	// still unsatisfiable and must be reported as OUT_OF_RANGE (the caller must fix the
+	// range). This is deliberately separate from the node phase, where a device larger
+	// than the request is not an error (see NodeExpandVolume).
+	if actualSizeGiB > 0 && maxVolSize > 0 && util.GiBToBytes(actualSizeGiB) > maxVolSize {
+		return nil, status.Errorf(codes.OutOfRange, "Volume %q current capacity %d GiB exceeds the limit specified", volumeID, actualSizeGiB)
 	}
 
 	nodeExpansionRequired := true

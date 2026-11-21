@@ -430,6 +430,16 @@ func (d *NodeService) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get block capacity on path %s: %v", req.GetVolumePath(), err)
 	}
+
+	// Resize reports success once the filesystem resize command has run, but the device
+	// (and thus the filesystem) can still be smaller than the capacity the CO requested,
+	// for example while the controller-side expansion is still propagating to the node.
+	// Report a retryable error in that case instead of a false success. An over-large
+	// result is never an error, since the CO only requires the requested capacity.
+	if requiredBytes := req.GetCapacityRange().GetRequiredBytes(); requiredBytes > 0 && bcap < requiredBytes {
+		return nil, status.Errorf(codes.ResourceExhausted,
+			"volume %q at %q is %d bytes, still smaller than the required %d bytes; retrying", volumeID, devicePath, bcap, requiredBytes)
+	}
 	return &csi.NodeExpandVolumeResponse{CapacityBytes: bcap}, nil
 }
 

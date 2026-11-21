@@ -6174,11 +6174,13 @@ func TestControllerUnpublishVolume(t *testing.T) {
 
 func TestControllerExpandVolume(t *testing.T) {
 	testCases := []struct {
-		name     string
-		req      *csi.ControllerExpandVolumeRequest
-		newSize  int32
-		expResp  *csi.ControllerExpandVolumeResponse
-		expError bool
+		name      string
+		req       *csi.ControllerExpandVolumeRequest
+		newSize   int32
+		resizeErr error
+		expResp   *csi.ControllerExpandVolumeResponse
+		expError  bool
+		expCode   codes.Code
 	}{
 		{
 			name: "success normal",
@@ -6196,6 +6198,7 @@ func TestControllerExpandVolume(t *testing.T) {
 			name:     "fail empty request",
 			req:      &csi.ControllerExpandVolumeRequest{},
 			expError: true,
+			expCode:  codes.InvalidArgument,
 		},
 		{
 			name: "fail exceeds limit after round up",
@@ -6207,6 +6210,43 @@ func TestControllerExpandVolume(t *testing.T) {
 				},
 			},
 			expError: true,
+			expCode:  codes.InvalidArgument,
+		},
+		{
+			name: "fail cloud modification cooldown is retryable",
+			req: &csi.ControllerExpandVolumeRequest{
+				VolumeId: "vol-test",
+				CapacityRange: &csi.CapacityRange{
+					RequiredBytes: 5 * util.GiB,
+				},
+			},
+			resizeErr: &cloud.VolumeModificationError{
+				VolumeID:          "vol-test",
+				RequestedSizeGiB:  5,
+				CurrentSizeGiB:    3,
+				ModificationState: "unknown",
+				Err:               cloud.ErrVolumeModificationRateExceeded,
+			},
+			expError: true,
+			expCode:  codes.ResourceExhausted,
+		},
+		{
+			name: "fail optimizing in-flight modification is retryable",
+			req: &csi.ControllerExpandVolumeRequest{
+				VolumeId: "vol-test",
+				CapacityRange: &csi.CapacityRange{
+					RequiredBytes: 5 * util.GiB,
+				},
+			},
+			resizeErr: &cloud.VolumeModificationError{
+				VolumeID:          "vol-test",
+				RequestedSizeGiB:  5,
+				CurrentSizeGiB:    3,
+				ModificationState: "optimizing",
+				Err:               cloud.ErrVolumeModificationInProgress,
+			},
+			expError: true,
+			expCode:  codes.ResourceExhausted,
 		},
 		{
 			name: "fail node-local volume cannot be expanded",
@@ -6217,6 +6257,7 @@ func TestControllerExpandVolume(t *testing.T) {
 				},
 			},
 			expError: true,
+			expCode:  codes.InvalidArgument,
 		},
 	}
 
@@ -6236,7 +6277,7 @@ func TestControllerExpandVolume(t *testing.T) {
 			mockCloud := cloud.NewMockCloud(mockCtl)
 			mockCloud.EXPECT().GetDiskByID(testutil.AnyContext(), gomock.Eq(tc.req.GetVolumeId())).AnyTimes()
 			//nolint:forbidigo // This function is called multiple times in a way that is difficult to fix. TODO: Refactor this test to remove gomock.AssignableToTypeOf().
-			mockCloud.EXPECT().ResizeOrModifyDisk(testutil.AnyContext(), gomock.Eq(tc.req.GetVolumeId()), gomock.Eq(util.GiBToBytes(retSizeGiB)), gomock.AssignableToTypeOf(&cloud.ModifyDiskOptions{})).Return(retSizeGiB, nil).AnyTimes()
+			mockCloud.EXPECT().ResizeOrModifyDisk(testutil.AnyContext(), gomock.Eq(tc.req.GetVolumeId()), gomock.Eq(util.GiBToBytes(retSizeGiB)), gomock.AssignableToTypeOf(&cloud.ModifyDiskOptions{})).Return(retSizeGiB, tc.resizeErr).AnyTimes()
 
 			awsDriver := ControllerService{
 				cloud:                 mockCloud,
@@ -6254,6 +6295,7 @@ func TestControllerExpandVolume(t *testing.T) {
 				if !tc.expError {
 					t.Fatalf("Unexpected error: %v", err)
 				}
+				assert.Equal(t, tc.expCode, status.Code(err), "unexpected gRPC code for %v", err)
 			} else if tc.expError {
 				t.Fatalf("Expected error from ControllerExpandVolume, got nothing")
 			}
@@ -6267,11 +6309,43 @@ func TestControllerExpandVolume(t *testing.T) {
 	}
 }
 
+// TestControllerExpandVolumeCurrentCapacityExceedsLimit covers a request whose limit is
+// below the volume's existing capacity: no modification is needed, but the capacity range
+// is still unsatisfiable and must be reported as OUT_OF_RANGE rather than success.
+func TestControllerExpandVolumeCurrentCapacityExceedsLimit(t *testing.T) {
+	ctx := t.Context()
+	mockCtl := gomock.NewController(t)
+	defer mockCtl.Finish()
+
+	mockCloud := cloud.NewMockCloud(mockCtl)
+	mockCloud.EXPECT().GetDiskByID(testutil.AnyContext(), gomock.Eq("vol-test")).AnyTimes()
+	mockCloud.EXPECT().ResizeOrModifyDisk(testutil.AnyContext(), gomock.Eq("vol-test"), gomock.Eq(util.GiBToBytes(5)), gomock.AssignableToTypeOf(&cloud.ModifyDiskOptions{})).Return(int32(10), nil).AnyTimes()
+
+	awsDriver := ControllerService{
+		cloud:                 mockCloud,
+		inFlight:              internal.NewInFlight(),
+		options:               &Options{},
+		modifyVolumeCoalescer: newModifyVolumeCoalescer(mockCloud, &Options{}),
+	}
+
+	_, err := awsDriver.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{
+		VolumeId: "vol-test",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: 5 * util.GiB,
+			LimitBytes:    8 * util.GiB, // below the volume's current 10 GiB
+		},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.OutOfRange, status.Code(err))
+}
+
 func TestControllerModifyVolume(t *testing.T) {
 	testCases := []struct {
-		name     string
-		req      *csi.ControllerModifyVolumeRequest
-		expError bool
+		name      string
+		req       *csi.ControllerModifyVolumeRequest
+		resizeErr error
+		expError  bool
+		expCode   codes.Code
 	}{
 		{
 			name: "fail node-local volume cannot be modified",
@@ -6282,6 +6356,24 @@ func TestControllerModifyVolume(t *testing.T) {
 				},
 			},
 			expError: true,
+			expCode:  codes.InvalidArgument,
+		},
+		{
+			name: "cooldown rejection maps to the same retryable code as ControllerExpandVolume",
+			req: &csi.ControllerModifyVolumeRequest{
+				VolumeId: "vol-test",
+				MutableParameters: map[string]string{
+					"iops": "4000",
+				},
+			},
+			resizeErr: &cloud.VolumeModificationError{
+				VolumeID:          "vol-test",
+				CurrentSizeGiB:    100,
+				ModificationState: "unknown",
+				Err:               cloud.ErrVolumeModificationRateExceeded,
+			},
+			expError: true,
+			expCode:  codes.ResourceExhausted,
 		},
 	}
 
@@ -6292,6 +6384,7 @@ func TestControllerModifyVolume(t *testing.T) {
 			defer mockCtl.Finish()
 
 			mockCloud := cloud.NewMockCloud(mockCtl)
+			mockCloud.EXPECT().ResizeOrModifyDisk(testutil.AnyContext(), gomock.Eq(tc.req.GetVolumeId()), gomock.Any(), gomock.AssignableToTypeOf(&cloud.ModifyDiskOptions{})).Return(int32(0), tc.resizeErr).AnyTimes()
 
 			awsDriver := ControllerService{
 				cloud:                 mockCloud,
@@ -6303,7 +6396,7 @@ func TestControllerModifyVolume(t *testing.T) {
 			_, err := awsDriver.ControllerModifyVolume(ctx, tc.req)
 			if tc.expError {
 				require.Error(t, err)
-				assert.Equal(t, codes.InvalidArgument, status.Code(err))
+				assert.Equal(t, tc.expCode, status.Code(err))
 			} else {
 				require.NoError(t, err)
 			}

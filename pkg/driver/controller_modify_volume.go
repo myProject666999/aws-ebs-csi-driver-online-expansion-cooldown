@@ -139,6 +139,30 @@ func executeModifyTagsRequest(volumeID string, options modifyVolumeRequest, c cl
 	return nil
 }
 
+// modificationNotReadyCode is the gRPC code returned when the cloud provider refuses a
+// volume modification because the volume is still cooling down from, or has an
+// in-flight, previous modification.
+//
+// ResourceExhausted is chosen over Aborted deliberately:
+//   - The CSI error scheme reserves ABORTED for "operation pending for volume", i.e. a
+//     duplicate concurrent call for the same volume. This driver already returns
+//     ABORTED for its own in-flight conflicts (VolumeOperationAlreadyExists), so reusing
+//     it here would make a cloud-side cooldown indistinguishable in logs and events.
+//   - RESOURCE_EXHAUSTED means "server temporarily out of resources", which describes a
+//     volume whose modification capacity is temporarily unavailable and will clear on
+//     its own.
+//   - external-resizer's IsFinalError (pkg/util) treats both ABORTED and
+//     RESOURCE_EXHAUSTED as non-final, so either triggers retry with exponential
+//     backoff; RESOURCE_EXHAUSTED yields that backoff without misusing ABORTED.
+const modificationNotReadyCode = codes.ResourceExhausted
+
+// isModificationNotReadyError reports whether err reflects a cloud-side condition (a
+// modification cooldown rejection or an in-flight "optimizing" modification) that will
+// clear on its own and should be retried with backoff rather than treated as a failure.
+func isModificationNotReadyError(err error) bool {
+	return errors.Is(err, cloud.ErrVolumeModificationRateExceeded) || errors.Is(err, cloud.ErrVolumeModificationInProgress)
+}
+
 func executeModifyVolumeRequest(c cloud.Cloud) func(string, modifyVolumeRequest) (int32, error) {
 	return func(volumeID string, req modifyVolumeRequest) (int32, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -161,6 +185,11 @@ func executeModifyVolumeRequest(c cloud.Cloud) func(string, modifyVolumeRequest)
 					return 0, status.Errorf(codes.InvalidArgument, "Could not modify volume (invalid argument) %q: %v", volumeID, err)
 				case errors.Is(err, cloud.ErrNotFound):
 					return 0, status.Errorf(codes.NotFound, "Could not modify volume (not found) %q: %v", volumeID, err)
+				case isModificationNotReadyError(err):
+					// Cooldown rejection from EC2 or an optimizing previous modification.
+					// Return a retryable code so external-resizer backs off instead of the
+					// driver sleeping or holding the coalescer/inFlight entry.
+					return 0, status.Errorf(modificationNotReadyCode, "Could not modify volume (modification not ready) %q: %v", volumeID, err)
 				case errors.Is(err, cloud.ErrLimitExceeded):
 					return 0, status.Errorf(codes.ResourceExhausted, "Could not modify volume (resource exhausted) %q: %v", volumeID, err)
 				default:

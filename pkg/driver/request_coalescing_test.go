@@ -30,6 +30,9 @@ import (
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/driver/internal"
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/testutil"
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/util"
+	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 )
 
@@ -529,4 +532,107 @@ func wrapTimeout(t *testing.T, failMessage string, execFunc func()) {
 		t.Error(failMessage)
 	case <-done:
 	}
+}
+
+// TestCoalescedModificationAndExpansionIssueOneModifyVolume verifies that a capacity
+// request and a VAC (attribute) request submitted together are merged into a single
+// ResizeOrModifyDisk call carrying both the size and the volume type.
+func TestCoalescedModificationAndExpansionIssueOneModifyVolume(t *testing.T) {
+	const VolumeType = "gp3"
+	const NewSize = 5 * util.GiB
+	volumeID := t.Name()
+
+	mockCtl := gomock.NewController(t)
+	defer mockCtl.Finish()
+
+	mockCloud := cloud.NewMockCloud(mockCtl)
+	mockCloud.EXPECT().GetDiskByID(testutil.AnyContext(), gomock.Eq(volumeID)).AnyTimes()
+	mockCloud.EXPECT().
+		ResizeOrModifyDisk(testutil.AnyContext(), gomock.Eq(volumeID), gomock.Eq(NewSize), gomock.Eq(&cloud.ModifyDiskOptions{VolumeType: VolumeType})).
+		Return(int32(5), nil).
+		Times(1)
+
+	options := &Options{ModifyVolumeRequestHandlerTimeout: 2 * time.Second}
+	awsDriver := ControllerService{
+		cloud:                 mockCloud,
+		inFlight:              internal.NewInFlight(),
+		options:               options,
+		modifyVolumeCoalescer: newModifyVolumeCoalescer(mockCloud, options),
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go wrapTimeout(t, "ControllerExpandVolume timed out", func() {
+		defer wg.Done()
+		if _, err := awsDriver.ControllerExpandVolume(t.Context(), &csi.ControllerExpandVolumeRequest{
+			VolumeId:      volumeID,
+			CapacityRange: &csi.CapacityRange{RequiredBytes: NewSize},
+		}); err != nil {
+			t.Errorf("ControllerExpandVolume returned error: %v", err)
+		}
+	})
+	go wrapTimeout(t, "ControllerModifyVolume timed out", func() {
+		defer wg.Done()
+		if _, err := awsDriver.ControllerModifyVolume(t.Context(), &csi.ControllerModifyVolumeRequest{
+			VolumeId:          volumeID,
+			MutableParameters: map[string]string{ModificationKeyVolumeType: VolumeType},
+		}); err != nil {
+			t.Errorf("ControllerModifyVolume returned error: %v", err)
+		}
+	})
+	wg.Wait()
+}
+
+// TestCoalescedModificationCooldownFailsAllWaiters verifies that when the single
+// coalesced ModifyVolume is rejected by a cloud cooldown, every waiting caller
+// (ControllerExpandVolume and ControllerModifyVolume) receives the same retryable
+// ResourceExhausted code.
+func TestCoalescedModificationCooldownFailsAllWaiters(t *testing.T) {
+	const VolumeType = "gp3"
+	const NewSize = 5 * util.GiB
+	volumeID := t.Name()
+
+	mockCtl := gomock.NewController(t)
+	defer mockCtl.Finish()
+
+	mockCloud := cloud.NewMockCloud(mockCtl)
+	mockCloud.EXPECT().GetDiskByID(testutil.AnyContext(), gomock.Eq(volumeID)).AnyTimes()
+	mockCloud.EXPECT().
+		ResizeOrModifyDisk(testutil.AnyContext(), gomock.Eq(volumeID), gomock.Eq(NewSize), gomock.Eq(&cloud.ModifyDiskOptions{VolumeType: VolumeType})).
+		Return(int32(0), &cloud.VolumeModificationError{
+			VolumeID:          volumeID,
+			RequestedSizeGiB:  5,
+			CurrentSizeGiB:    1,
+			ModificationState: "unknown",
+			Err:               cloud.ErrVolumeModificationRateExceeded,
+		}).
+		Times(1)
+
+	options := &Options{ModifyVolumeRequestHandlerTimeout: 2 * time.Second}
+	awsDriver := ControllerService{
+		cloud:                 mockCloud,
+		inFlight:              internal.NewInFlight(),
+		options:               options,
+		modifyVolumeCoalescer: newModifyVolumeCoalescer(mockCloud, options),
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go wrapTimeout(t, "ControllerExpandVolume timed out", func() {
+		defer wg.Done()
+		_, err := awsDriver.ControllerExpandVolume(t.Context(), &csi.ControllerExpandVolumeRequest{
+			VolumeId:      volumeID,
+			CapacityRange: &csi.CapacityRange{RequiredBytes: NewSize},
+		})
+		assert.Equal(t, codes.ResourceExhausted, status.Code(err), "expand waiter code, err: %v", err)
+	})
+	go wrapTimeout(t, "ControllerModifyVolume timed out", func() {
+		defer wg.Done()
+		_, err := awsDriver.ControllerModifyVolume(t.Context(), &csi.ControllerModifyVolumeRequest{
+			VolumeId:          volumeID,
+			MutableParameters: map[string]string{ModificationKeyVolumeType: VolumeType},
+		})
+		assert.Equal(t, codes.ResourceExhausted, status.Code(err), "modify waiter code, err: %v", err)
+	})
+	wg.Wait()
 }
